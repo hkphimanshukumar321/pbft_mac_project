@@ -7,7 +7,7 @@ from torch.cuda.amp import autocast, GradScaler
 from typing import Dict, Tuple, List, Optional
 from collections import defaultdict, deque
 import random
-#improved consistency 
+
 from .core import (
     Config,
     ScenarioParams,
@@ -25,28 +25,33 @@ from .core import (
     count_transmissions,
     calculate_energy,
     calculate_throughput,
-    T_SIM
 )
 
-# Choose device
+# ============================================================================
+# GLOBAL SETUP
+# ============================================================================
+
+# Device selection for PyTorch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[RL] Using device: {device}")
 
 
-# ============================================================================#
-# HELPER FUNCTIONS
-# ============================================================================#
+# ============================================================================
+# HELPER FUNCTIONS: STATE REPRESENTATION
+# ============================================================================
 
 def discretize_context(ctx: Dict, n_bins: int = 10) -> Tuple:
     """
     Discretize continuous context features into bins for tabular Q-learning.
     
     Args:
-        ctx: Context dictionary with keys like 'dCenters', 'meanD', 'estPER', etc.
-        n_bins: Number of bins for discretization
+        ctx: Context dictionary with keys 'dCenters', 'meanD', 'estPER', 
+             'N', 'if_prob', 'bgLoad'
+        n_bins: Number of bins for discretization (default: 10)
     
     Returns:
-        Tuple of discretized state values
+        Tuple of discretized state values (d_centers_bin, mean_d_bin, 
+        per_bin, n_nodes, if_prob_bin, bg_load_bin)
     """
     # Discretize distance to center (0-1000m range)
     d_centers_bin = min(n_bins - 1, int(ctx['dCenters'] / 100.0))
@@ -74,175 +79,206 @@ def context_to_state_vector(ctx: Dict) -> np.ndarray:
     Convert context dictionary to continuous state vector for neural network agents.
     
     Args:
-        ctx: Context dictionary
+        ctx: Context dictionary with keys 'dCenters', 'meanD', 'estPER', 
+             'N', 'if_prob', 'bgLoad'
     
     Returns:
-        numpy array of shape (6,) with normalized features
+        Normalized numpy array of shape (6,) with features in [0, 1] range
     """
     return np.array([
-        ctx['dCenters'] / 1000.0,      # Normalize to [0, 1] range
-        ctx['meanD'] / 1000.0,          # Normalize to [0, 1] range
-        ctx['estPER'],                  # Already in [0, 1]
-        ctx['N'] / 10.0,                # Normalize assuming max 10 nodes
-        ctx['if_prob'],                 # Already in [0, 1]
-        ctx['bgLoad']                   # Already in [0, 1]
+        ctx['dCenters'] / 1000.0,    # Normalize to [0, 1] (max 1000m)
+        ctx['meanD'] / 1000.0,        # Normalize to [0, 1] (max 1000m)
+        ctx['estPER'],                # Already in [0, 1]
+        ctx['N'] / 10.0,              # Normalize assuming max 10 nodes
+        ctx['if_prob'],               # Already in [0, 1]
+        ctx['bgLoad']                 # Already in [0, 1]
     ], dtype=np.float32)
 
 
-# ============================================================================#
-# PBFT SIMULATION CORE (Enhanced with Energy & Throughput)
-# ============================================================================#
+# ============================================================================
+# PBFT SIMULATION CORE
+# ============================================================================
 
-def pbft_round(macType: str, primary: int, pos0: np.ndarray, N: int, t0: float,
-               eff: Dict, SCN: ScenarioParams, CS: CSMAParams, TDMA: TDMAParams,
-               cfg: Config) -> PBFTResult:
+def pbft_round(
+    mac_type: str,
+    primary: int,
+    pos0: np.ndarray,
+    N: int,
+    t0: float,
+    eff: Dict,
+    scn: ScenarioParams,
+    cs: CSMAParams,
+    tdma: TDMAParams,
+    cfg: Config
+) -> PBFTResult:
     """
     Execute one PBFT consensus round with specified MAC protocol.
     
     Args:
-        macType: 'CSMA' or 'TDMA'
-        primary: Index of primary node
-        pos0: Node positions array
+        mac_type: MAC protocol type ('CSMA' or 'TDMA')
+        primary: Index of primary node (0 to N-1)
+        pos0: Node positions array of shape (N, 2)
         N: Number of nodes
-        t0: Start time
-        eff: Efficiency dictionary
-        SCN: Scenario parameters
-        CS: CSMA parameters
-        TDMA: TDMA parameters
-        cfg: Configuration
+        t0: Start time in seconds
+        eff: Efficiency dictionary with keys 'CS_base', 'IF_ON', 'PER_jam'
+        scn: Scenario parameters
+        cs: CSMA parameters
+        tdma: TDMA parameters
+        cfg: Configuration object
     
     Returns:
-        PBFTResult with all metrics
+        PBFTResult object containing all metrics (latency, energy, throughput, etc.)
     """
     result = PBFTResult()
     quorum = 2 * cfg.QUORUM_F + 1
-    phaseDelay = np.full(3, np.nan)
+    phase_delays = np.full(3, np.nan)
     
-    # Phase 1: Pre-Prepare
-    delays = []
-    if macType == 'CSMA':
-        backoff = csma_backoff_delay(0, CS, eff, N, N)
+    # ========================================================================
+    # PHASE 1: PRE-PREPARE (Primary -> All Replicas)
+    # ========================================================================
+    delays_phase1 = []
+    
+    if mac_type == 'CSMA':
+        backoff = csma_backoff_delay(0, cs, eff, N, N)
     else:
         backoff = 0.0
     
-    tstart = t0 + backoff if macType == 'CSMA' else next_tdma_start(t0, primary, TDMA)
+    t_start_phase1 = t0 + backoff if mac_type == 'CSMA' else next_tdma_start(t0, primary, tdma)
     
     for rx in range(N):
         if rx == primary:
             continue
-        d = link_delay(macType, primary, rx, tstart, pos0, cfg.R_BPS, cfg.L_CTRL,
-                      cfg.C, cfg.PL0_DB, cfg.N_PL, cfg.SIGMA_SF, cfg.PER0,
-                      cfg.PLOSS_X, eff, CS, TDMA)
+        d = link_delay(
+            mac_type, primary, rx, t_start_phase1, pos0, cfg.R_BPS, cfg.L_CTRL,
+            cfg.C, cfg.PL0_DB, cfg.N_PL, cfg.SIGMA_SF, cfg.PER0,
+            cfg.PLOSS_X, eff, cs, tdma
+        )
         if np.isfinite(d):
-            delays.append(d)
+            delays_phase1.append(d)
     
-    if len(delays) >= quorum - 1:
-        phaseDelay[0] = max(delays)
+    # Check if quorum reached in Phase 1
+    if len(delays_phase1) >= quorum - 1:
+        phase_delays[0] = max(delays_phase1)
     else:
         result.success = False
         result.views = 1
-        result.phase_delays = phaseDelay
+        result.phase_delays = phase_delays
         return result
     
-    # Phase 2: Prepare
-    t1 = tstart + phaseDelay[0]
-    delays2 = []
+    # ========================================================================
+    # PHASE 2: PREPARE (All Replicas -> All Replicas)
+    # ========================================================================
+    t1 = t_start_phase1 + phase_delays[0]
+    delays_phase2 = []
     
     for tx in range(N):
         if tx == primary:
             continue
-        if macType == 'CSMA':
-            backoff = csma_backoff_delay(0, CS, eff, N-1, N)
+        
+        if mac_type == 'CSMA':
+            backoff = csma_backoff_delay(0, cs, eff, N - 1, N)
         else:
             backoff = 0.0
         
-        tstart2 = t1 + backoff if macType == 'CSMA' else next_tdma_start(t1, tx, TDMA)
+        t_start_phase2 = t1 + backoff if mac_type == 'CSMA' else next_tdma_start(t1, tx, tdma)
         
         for rx in range(N):
             if rx == tx:
                 continue
-            d = link_delay(macType, tx, rx, tstart2, pos0, cfg.R_BPS, cfg.L_CTRL,
-                          cfg.C, cfg.PL0_DB, cfg.N_PL, cfg.SIGMA_SF, cfg.PER0,
-                          cfg.PLOSS_X, eff, CS, TDMA)
+            d = link_delay(
+                mac_type, tx, rx, t_start_phase2, pos0, cfg.R_BPS, cfg.L_CTRL,
+                cfg.C, cfg.PL0_DB, cfg.N_PL, cfg.SIGMA_SF, cfg.PER0,
+                cfg.PLOSS_X, eff, cs, tdma
+            )
             if np.isfinite(d):
-                delays2.append(d)
+                delays_phase2.append(d)
     
-    needed = (N - 1) * (quorum - 1)
-    if len(delays2) >= needed:
-        phaseDelay[1] = max(delays2)
+    # Check if quorum reached in Phase 2
+    needed_phase2 = (N - 1) * (quorum - 1)
+    if len(delays_phase2) >= needed_phase2:
+        phase_delays[1] = max(delays_phase2)
     else:
         result.success = False
         result.views = 1
-        result.phase_delays = phaseDelay
+        result.phase_delays = phase_delays
         return result
     
-    # Phase 3: Commit
-    t2 = tstart2 + phaseDelay[1]
-    delays3 = []
+    # ========================================================================
+    # PHASE 3: COMMIT (All Nodes -> All Nodes)
+    # ========================================================================
+    t2 = t_start_phase2 + phase_delays[1]
+    delays_phase3 = []
     
     for tx in range(N):
-        if macType == 'CSMA':
-            backoff = csma_backoff_delay(0, CS, eff, N, N)
+        if mac_type == 'CSMA':
+            backoff = csma_backoff_delay(0, cs, eff, N, N)
         else:
             backoff = 0.0
         
-        tstart3 = t2 + backoff if macType == 'CSMA' else next_tdma_start(t2, tx, TDMA)
+        t_start_phase3 = t2 + backoff if mac_type == 'CSMA' else next_tdma_start(t2, tx, tdma)
         
         for rx in range(N):
             if rx == tx:
                 continue
-            d = link_delay(macType, tx, rx, tstart3, pos0, cfg.R_BPS, cfg.L_CTRL,
-                          cfg.C, cfg.PL0_DB, cfg.N_PL, cfg.SIGMA_SF, cfg.PER0,
-                          cfg.PLOSS_X, eff, CS, TDMA)
+            d = link_delay(
+                mac_type, tx, rx, t_start_phase3, pos0, cfg.R_BPS, cfg.L_CTRL,
+                cfg.C, cfg.PL0_DB, cfg.N_PL, cfg.SIGMA_SF, cfg.PER0,
+                cfg.PLOSS_X, eff, cs, tdma
+            )
             if np.isfinite(d):
-                delays3.append(d)
+                delays_phase3.append(d)
     
-    needed = N * (quorum - 1)
-    if len(delays3) >= needed:
-        phaseDelay[2] = max(delays3)
+    # Check if quorum reached in Phase 3
+    needed_phase3 = N * (quorum - 1)
+    if len(delays_phase3) >= needed_phase3:
+        phase_delays[2] = max(delays_phase3)
     else:
         result.success = False
         result.views = 1
-        result.phase_delays = phaseDelay
+        result.phase_delays = phase_delays
         return result
     
-    # Success: Calculate all metrics
+    # ========================================================================
+    # SUCCESS: Calculate All Metrics
+    # ========================================================================
     result.success = True
     result.views = 1
-    result.phase_delays = phaseDelay
+    result.phase_delays = phase_delays
     
     # Total latency (seconds)
-    total_latency_sec = float(np.sum(phaseDelay))
+    total_latency_sec = float(np.sum(phase_delays))
     result.latency = total_latency_sec
-    result.latency_ms = total_latency_sec * 1000.0  # Convert to ms
+    result.latency_ms = total_latency_sec * 1000.0  # Convert to milliseconds
     
     # Count transmissions and collisions
-    n_trans, n_coll = count_transmissions(phaseDelay, N)
+    n_trans, n_coll = count_transmissions(phase_delays, N)
     result.n_transmissions = n_trans
     result.n_collisions = n_coll
     
-    # Calculate energy (µJ)
-    result.energy = calculate_energy(macType, N, SCN, CS, TDMA, n_trans, 
-                                     total_latency_sec, cfg)
+    # Calculate energy consumption (µJ)
+    result.energy = calculate_energy(
+        mac_type, N, scn, cs, tdma, n_trans, total_latency_sec, cfg
+    )
     
     # Estimate PER for throughput calculation
-    ctx = extract_context(pos0, N, SCN, eff)
-    estPER = ctx['estPER']
+    ctx = extract_context(pos0, N, scn, eff)
+    est_per = ctx['estPER']
     
     # Calculate throughput (Mbps)
-    result.throughput = calculate_throughput(macType, N, SCN, total_latency_sec,
-                                            result.success, estPER, cfg)
+    result.throughput = calculate_throughput(
+        mac_type, N, scn, total_latency_sec, result.success, est_per, cfg
+    )
     
-    # Margin calculation
-    if np.all(np.isfinite(phaseDelay)):
+    # Calculate margin (time before timeout)
+    if np.all(np.isfinite(phase_delays)):
         result.margin = cfg.T_TIMEOUT - total_latency_sec
     
     return result
 
 
-# ============================================================================#
+# ============================================================================
 # REWARD CALCULATION WITH PHYSICAL UNITS
-# ============================================================================#
+# ============================================================================
 
 def base_physical_reward(result: PBFTResult, cfg: Config) -> float:
     """
@@ -253,34 +289,35 @@ def base_physical_reward(result: PBFTResult, cfg: Config) -> float:
         cfg: Configuration with reward parameters
     
     Returns:
-        Base reward value
+        Reward value based on physical metrics
     """
     if not result.success:
         return cfg.FAILURE_REWARD
 
-    # Extract relevant metrics with safety checks
-    L_ms = result.latency_ms if np.isfinite(result.latency_ms) else cfg.T_TIMEOUT * 1000.0
-    E_uj = result.energy if np.isfinite(result.energy) else 200.0
-    T_mbps = result.throughput if np.isfinite(result.throughput) else 0.0
+    # Extract metrics with safety checks
+    latency_ms = result.latency_ms if np.isfinite(result.latency_ms) else cfg.T_TIMEOUT * 1000.0
+    energy_uj = result.energy if np.isfinite(result.energy) else 200.0
+    throughput_mbps = result.throughput if np.isfinite(result.throughput) else 0.0
 
     # Normalization references
     deadline_ms = max(1.0, cfg.T_TIMEOUT * 1000.0)
-    E_ref = 100.0  # reference energy in µJ
-    T_ref = max(1.0, cfg.SCALE_THROUGHPUT_MBPS)  # ~10 Mbps scale
+    energy_ref_uj = 100.0  # Reference energy in µJ
+    throughput_ref_mbps = max(1.0, cfg.SCALE_THROUGHPUT_MBPS)  # ~10 Mbps scale
 
-    # Normalize values (clamp to reasonable range)
-    L_norm = min(2.0, L_ms / deadline_ms)
-    E_norm = min(2.0, E_uj / E_ref)
-    T_norm = min(2.0, T_mbps / T_ref)
+    # Normalize values (clamp to reasonable range [0, 2])
+    latency_norm = min(2.0, latency_ms / deadline_ms)
+    energy_norm = min(2.0, energy_uj / energy_ref_uj)
+    throughput_norm = min(2.0, throughput_mbps / throughput_ref_mbps)
 
     # Weight factors from Config
-    lambda_L = cfg.LAMBDA_L
-    lambda_E = cfg.LAMBDA_E
-    lambda_T = cfg.LAMBDA_T
+    lambda_l = cfg.LAMBDA_L  # Latency weight
+    lambda_e = cfg.LAMBDA_E  # Energy weight
+    lambda_t = cfg.LAMBDA_T  # Throughput weight
 
-    # Success reward formula
-    s = 1.0
-    return s - lambda_L * L_norm - lambda_E * E_norm + lambda_T * T_norm
+    # Reward formula: success baseline - penalties + bonus
+    reward = 1.0 - lambda_l * latency_norm - lambda_e * energy_norm + lambda_t * throughput_norm
+    
+    return reward
 
 
 def qlearning_reward(result: PBFTResult, cfg: Config) -> float:
@@ -304,23 +341,28 @@ def qrdqn_reward(result: PBFTResult, cfg: Config, eff: Dict) -> float:
     Args:
         result: PBFT result
         cfg: Configuration
-        eff: Efficiency dictionary with interference info
+        eff: Efficiency dictionary with interference info (must contain 'IF_ON')
     
     Returns:
         Reward value with jamming bonus
     """
     # Base reward from physical metrics
-    r_phys = base_physical_reward(result, cfg)
+    reward_phys = base_physical_reward(result, cfg)
 
-    # Add a small jamming bonus if interference is ON
-    delta_jam = 1.0 if eff.get("IF_ON", False) else 0.0
-    return r_phys + cfg.THETA_JAM * delta_jam
+    # Add jamming bonus if interference is active
+    jamming_bonus = 1.0 if eff.get("IF_ON", False) else 0.0
+    
+    return reward_phys + cfg.THETA_JAM * jamming_bonus
 
 
-def calculate_reward(result: PBFTResult, cfg: Config, agent_type: str, 
-                     eff: Optional[Dict] = None) -> float:
+def calculate_reward(
+    result: PBFTResult,
+    cfg: Config,
+    agent_type: str,
+    eff: Optional[Dict] = None
+) -> float:
     """
-    Unified reward calculation function for both Q-learning and QR-DQN agents.
+    Unified reward calculation function for all agent types.
     
     Args:
         result: PBFT result containing metrics
@@ -341,24 +383,30 @@ def calculate_reward(result: PBFTResult, cfg: Config, agent_type: str,
             raise ValueError("eff parameter required for QR-DQN reward calculation")
         return qrdqn_reward(result, cfg, eff)
     else:
-        raise ValueError(f"Unknown agent type: {agent_type}")
+        raise ValueError(f"Unknown agent type: {agent_type}. Must be 'Q-learning' or 'QR-DQN'")
 
 
-# ============================================================================#
+# ============================================================================
 # REPLAY BUFFER FOR QR-DQN
-# ============================================================================#
+# ============================================================================
 
 class ReplayBuffer:
     """Experience replay buffer for QR-DQN with efficient sampling."""
     
-    def __init__(self, buffer_size: int, batch_size: int, gamma: float, device: torch.device):
+    def __init__(
+        self,
+        buffer_size: int,
+        batch_size: int,
+        gamma: float,
+        device: torch.device
+    ):
         """
         Initialize replay buffer.
         
         Args:
             buffer_size: Maximum buffer capacity
             batch_size: Size of sampled batches
-            gamma: Discount factor (stored for consistency)
+            gamma: Discount factor (stored for reference)
             device: PyTorch device for tensors
         """
         self.memory = deque(maxlen=buffer_size)
@@ -370,17 +418,23 @@ class ReplayBuffer:
         """Return current buffer size."""
         return len(self.memory)
 
-    def add(self, state: np.ndarray, action: int, reward: float,
-            next_state: np.ndarray, done: bool) -> None:
+    def add(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool
+    ) -> None:
         """
         Add experience tuple to buffer.
         
         Args:
-            state: Current state
-            action: Action taken
-            reward: Reward received
-            next_state: Next state
-            done: Episode termination flag
+            state: Current state (numpy array)
+            action: Action taken (int)
+            reward: Reward received (float)
+            next_state: Next state (numpy array)
+            done: Episode termination flag (bool)
         """
         self.memory.append((state, action, reward, next_state, done))
 
@@ -390,7 +444,7 @@ class ReplayBuffer:
         Sample a mini-batch and return tensors on the correct device.
         
         Returns:
-            Tuple of (states, actions, rewards, next_states, dones) as tensors
+            Tuple of (states, actions, rewards, next_states, dones) as PyTorch tensors
         """
         batch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
@@ -400,28 +454,34 @@ class ReplayBuffer:
         next_states_np = np.stack(next_states).astype(np.float32)
 
         # Convert to tensors on device
-        states = torch.from_numpy(states_np).to(self.device)
-        next_states = torch.from_numpy(next_states_np).to(self.device)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        states_tensor = torch.from_numpy(states_np).to(self.device)
+        next_states_tensor = torch.from_numpy(next_states_np).to(self.device)
+        actions_tensor = torch.tensor(actions, dtype=torch.long, device=self.device)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        dones_tensor = torch.tensor(dones, dtype=torch.float32, device=self.device)
 
-        return states, actions, rewards, next_states, dones
+        return states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor
 
-# ============================================================================#
-# Q-LEARNING AGENT (Enhanced with Physical Unit Rewards)
-# ============================================================================#
+
+# ============================================================================
+# Q-LEARNING AGENT
+# ============================================================================
 
 class QLearningAgent:
-    """Tabular Q-Learning agent with physical unit rewards."""
+    """Tabular Q-Learning agent with epsilon-greedy exploration."""
     
-    def __init__(self, alpha: float = 0.1, gamma: float = 0.95, epsilon: float = 0.2):
+    def __init__(
+        self,
+        alpha: float = 0.1,
+        gamma: float = 0.95,
+        epsilon: float = 0.2
+    ):
         """
         Initialize Q-Learning agent.
         
         Args:
-            alpha: Learning rate
-            gamma: Discount factor
+            alpha: Learning rate (step size)
+            gamma: Discount factor for future rewards
             epsilon: Exploration rate for epsilon-greedy policy
         """
         self.alpha = alpha
@@ -432,22 +492,28 @@ class QLearningAgent:
     
     def get_action(self, state: Tuple, explore: bool = True) -> int:
         """
-        Epsilon-greedy action selection.
+        Select action using epsilon-greedy policy.
         
         Args:
             state: Discretized state tuple
             explore: Whether to use epsilon-greedy exploration
             
         Returns:
-            action: 0 (CSMA) or 1 (TDMA)
+            Action index: 0 (CSMA) or 1 (TDMA)
         """
         if explore and np.random.rand() < self.epsilon:
             return np.random.randint(2)
         return int(np.argmax(self.Q[state]))
     
-    def update(self, state: Tuple, action: int, reward: float, next_state: Tuple):
+    def update(
+        self,
+        state: Tuple,
+        action: int,
+        reward: float,
+        next_state: Tuple
+    ) -> None:
         """
-        Q-learning update with physical unit reward.
+        Q-learning update rule with physical unit rewards.
         
         Args:
             state: Current state tuple
@@ -456,92 +522,25 @@ class QLearningAgent:
             next_state: Next state tuple
         """
         self.visit_counts[state] += 1
-        best_next = np.max(self.Q[next_state])
-        td_target = reward + self.gamma * best_next
+        
+        # Q-learning update: Q(s,a) <- Q(s,a) + α[r + γ*max_a' Q(s',a') - Q(s,a)]
+        best_next_value = np.max(self.Q[next_state])
+        td_target = reward + self.gamma * best_next_value
         td_error = td_target - self.Q[state][action]
-        
-        self.Q[state][action] += self.alpha * td_error
 
-
-# ============================================================================#
-# HELPER FUNCTION: STATE DISCRETIZATION FOR Q-LEARNING
-# ============================================================================#
-
-def discretize_context(ctx: Dict) -> Tuple:
-    """
-    Convert continuous context to discrete state tuple for Q-Learning.
-    
-    Args:
-        ctx: Context dictionary from extract_context()
-        
-    Returns:
-        state: Discretized state tuple
-    """
-    # Discretize distance to centers (bins: <50m, 50-100m, 100-200m, >200m)
-    d_centers = ctx['dCenters']
-    if d_centers < 50:
-        d_bin = 0
-    elif d_centers < 100:
-        d_bin = 1
-    elif d_centers < 200:
-        d_bin = 2
-    else:
-        d_bin = 3
-    
-    # Discretize mean distance (bins: <50m, 50-100m, 100-200m, >200m)
-    mean_d = ctx['meanD']
-    if mean_d < 50:
-        mean_d_bin = 0
-    elif mean_d < 100:
-        mean_d_bin = 1
-    elif mean_d < 200:
-        mean_d_bin = 2
-    else:
-        mean_d_bin = 3
-    
-    # Discretize estimated PER (bins: <0.1, 0.1-0.3, 0.3-0.5, >0.5)
-    est_per = ctx['estPER']
-    if est_per < 0.1:
-        per_bin = 0
-    elif est_per < 0.3:
-        per_bin = 1
-    elif est_per < 0.5:
-        per_bin = 2
-    else:
-        per_bin = 3
-    
-    # Number of nodes (as is)
-    N = int(ctx['N'])
-    
-    # Interference probability (bins: <0.2, 0.2-0.5, >0.5)
-    if_prob = ctx['if_prob']
-    if if_prob < 0.2:
-        if_bin = 0
-    elif if_prob < 0.5:
-        if_bin = 1
-    else:
-        if_bin = 2
-    
-    # Background load (bins: <0.3, 0.3-0.6, >0.6)
-    bg_load = ctx['bgLoad']
-    if bg_load < 0.3:
-        bg_bin = 0
-    elif bg_load < 0.6:
-        bg_bin = 1
-    else:
-        bg_bin = 2
-    
-    return (d_bin, mean_d_bin, per_bin, N, if_bin, bg_bin)
-
-
-# ============================================================================#
-# QR-DQN NETWORK (Enhanced for Physical Unit Rewards)
-# ============================================================================#
+    # ============================================================================
+# QR-DQN NETWORK
+# ============================================================================
 
 class QRDQNNetwork(nn.Module):
-    """Quantile Regression DQN network."""
+    """Quantile Regression DQN network for distributional RL."""
     
-    def __init__(self, state_dim: int = 6, n_actions: int = 2, n_quantiles: int = 51):
+    def __init__(
+        self,
+        state_dim: int = 6,
+        n_actions: int = 2,
+        n_quantiles: int = 51
+    ):
         """
         Initialize QR-DQN network.
         
@@ -554,6 +553,7 @@ class QRDQNNetwork(nn.Module):
         self.n_quantiles = n_quantiles
         self.n_actions = n_actions
 
+        # Network architecture: state -> hidden layers -> quantile values
         self.fc1 = nn.Linear(state_dim, 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, n_actions * n_quantiles)
@@ -563,10 +563,10 @@ class QRDQNNetwork(nn.Module):
         Forward pass.
         
         Args:
-            x: State tensor (batch_size, state_dim)
+            x: State tensor of shape (batch_size, state_dim)
             
         Returns:
-            Quantile values (batch_size, n_actions, n_quantiles)
+            Quantile values of shape (batch_size, n_actions, n_quantiles)
         """
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -574,8 +574,12 @@ class QRDQNNetwork(nn.Module):
         return x.view(x.size(0), self.n_actions, self.n_quantiles)
 
 
+# ============================================================================
+# QR-DQN AGENT
+# ============================================================================
+
 class QRDQNAgent:
-    """QR-DQN agent with physical unit rewards."""
+    """QR-DQN agent with experience replay and target network."""
     
     def __init__(
         self,
@@ -584,7 +588,7 @@ class QRDQNAgent:
         gamma: float = 0.95,
         epsilon: float = 0.2,
         n_quantiles: int = 51,
-        buffer_size: int = 50_000,
+        buffer_size: int = 50000,
         batch_size: int = 64,
         tau_target: float = 0.005,
         device: torch.device = device
@@ -594,54 +598,59 @@ class QRDQNAgent:
         
         Args:
             state_dim: Dimension of state vector
-            lr: Learning rate
-            gamma: Discount factor
-            epsilon: Exploration rate
-            n_quantiles: Number of quantiles
-            buffer_size: Replay buffer size
-            batch_size: Mini-batch size
-            tau_target: Soft update coefficient for target network
-            device: torch device (CPU or CUDA)
+            lr: Learning rate for optimizer
+            gamma: Discount factor for future rewards
+            epsilon: Exploration rate for epsilon-greedy policy
+            n_quantiles: Number of quantiles for distributional RL
+            buffer_size: Maximum size of replay buffer
+            batch_size: Mini-batch size for training
+            tau_target: Soft update coefficient for target network (0 < tau <= 1)
+            device: PyTorch device (CPU or CUDA)
         """
         self.gamma = gamma
         self.epsilon = epsilon
         self.n_quantiles = n_quantiles
         self.device = device
         self.batch_size = batch_size
-        self.tau_target = tau_target  # Fixed: Added missing attribute
+        self.tau_target = tau_target
 
+        # Initialize main network and target network
         self.net = QRDQNNetwork(state_dim, n_actions=2, n_quantiles=n_quantiles).to(self.device)
         self.target_net = QRDQNNetwork(state_dim, n_actions=2, n_quantiles=n_quantiles).to(self.device)
         self.target_net.load_state_dict(self.net.state_dict())
         self.target_net.eval()
 
+        # Optimizer
         self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
 
+        # Mixed precision training (GPU only)
         self.scaler = GradScaler(enabled=(self.device.type == "cuda"))
 
+        # Quantile midpoints for QR-DQN loss
         self.tau = torch.linspace(0, 1, n_quantiles + 1, device=self.device)
         self.tau_hat = (self.tau[:-1] + self.tau[1:]) / 2.0
 
+        # Replay buffer
         self.replay_buffer = ReplayBuffer(buffer_size, batch_size, gamma, self.device)
 
     def get_action(self, state: np.ndarray, explore: bool = True) -> int:
         """
-        Action selection with epsilon-greedy exploration.
+        Select action using epsilon-greedy policy.
         
         Args:
-            state: State vector (numpy array)
+            state: State vector (numpy array of shape (state_dim,))
             explore: Whether to use epsilon-greedy exploration
             
         Returns:
-            action: 0 (CSMA) or 1 (TDMA)
+            Action index: 0 (CSMA) or 1 (TDMA)
         """
         if explore and np.random.rand() < self.epsilon:
             return np.random.randint(2)
         
         with torch.no_grad():
-            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            quantiles = self.net(state_t)
-            q_values = quantiles.mean(dim=2)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            quantiles = self.net(state_tensor)
+            q_values = quantiles.mean(dim=2)  # Average over quantiles
             return int(q_values.argmax(dim=1).item())
 
     def update(
@@ -651,9 +660,9 @@ class QRDQNAgent:
         reward: float,
         next_state: np.ndarray,
         done: bool = False
-    ):
+    ) -> None:
         """
-        Replay buffer update and gradient step.
+        Store experience and perform gradient update if buffer is ready.
         
         Args:
             state: Current state
@@ -662,20 +671,23 @@ class QRDQNAgent:
             next_state: Next state
             done: Whether episode is done
         """
+        # Add experience to replay buffer
         self.replay_buffer.add(state, action, reward, next_state, done)
         
+        # Wait until buffer has enough samples
         if len(self.replay_buffer) < self.batch_size:
             return
 
+        # Sample mini-batch
         states, actions, rewards, next_states, dones = self.replay_buffer.sample()
         batch_size = states.size(0)
 
-        # Current quantiles for taken actions
+        # Compute current quantiles for taken actions
         all_quantiles = self.net(states)
         actions_expanded = actions.view(-1, 1, 1).expand(batch_size, 1, self.n_quantiles)
         current_quantiles = all_quantiles.gather(1, actions_expanded).squeeze(1)
 
-        # Target quantiles (Double DQN style)
+        # Compute target quantiles (Double DQN style)
         with torch.no_grad():
             next_all_quantiles = self.target_net(next_states)
             next_q_values = next_all_quantiles.mean(dim=2)
@@ -710,21 +722,21 @@ class QRDQNAgent:
         # Soft update target network
         self.soft_update_target()
 
-    def soft_update_target(self):
-        """Soft update target network using tau_target."""
+    def soft_update_target(self) -> None:
+        """Soft update target network using Polyak averaging."""
         for target_param, param in zip(self.target_net.parameters(), self.net.parameters()):
             target_param.data.copy_(
                 self.tau_target * param.data + (1.0 - self.tau_target) * target_param.data
             )
 
-    def hard_update_target(self):
-        """Force a full copy of the target network (hard update)."""
+    def hard_update_target(self) -> None:
+        """Hard update target network (full copy)."""
         self.target_net.load_state_dict(self.net.state_dict())
 
 
-# ============================================================================#
-# TRAINING FUNCTIONS (Q-Learning & QR-DQN)
-# ============================================================================#
+# ============================================================================
+# TRAINING FUNCTIONS
+# ============================================================================
 
 def train_qlearning(
     scn: ScenarioParams,
@@ -744,10 +756,12 @@ def train_qlearning(
         n_episodes: Number of training episodes
         
     Returns:
-        Tuple of (trained_agent, reward_history)
+        Tuple of (trained_agent, episode_rewards)
     """
+    print(f"\n🎓 Training Q-Learning agent for {n_episodes} episodes...")
+    
     agent = QLearningAgent(alpha=0.1, gamma=0.95, epsilon=0.2)
-    reward_history = []
+    episode_rewards = []
 
     for ep in range(n_episodes):
         # Initialize episode
@@ -757,12 +771,14 @@ def train_qlearning(
         episode_reward = 0.0
 
         while t < cfg.T_SIM:
-            # Extract context
+            # Create efficiency dictionary
             eff = {
                 'CS_base': 0.1,
                 'IF_ON': np.random.rand() < scn.if_prob,
                 'PER_jam': 0.0
             }
+            
+            # Extract context and discretize state
             ctx = extract_context(pos, scn.N, scn, eff)
             state = discretize_context(ctx)
 
@@ -774,29 +790,32 @@ def train_qlearning(
             primary = np.random.randint(scn.N)
             result = pbft_round(mac_type, primary, pos, scn.N, t, eff, scn, cs, tdma, cfg)
 
-            # Calculate reward with physical units
+            # Calculate reward
             reward = calculate_reward(result, cfg, 'Q-learning')
             episode_reward += reward
 
-            # Update position
+            # Update position and time
             dt = result.latency if np.isfinite(result.latency) else cfg.DT
+            dt = max(dt, cfg.DT)  # Ensure minimum time step
             pos = update_positions(pos, vel, dt, scn.area)
             t += dt
 
-            # Next state
+            # Get next state
             ctx_next = extract_context(pos, scn.N, scn, eff)
             next_state = discretize_context(ctx_next)
 
             # Q-learning update
             agent.update(state, action, reward, next_state)
 
-        reward_history.append(episode_reward)
+        episode_rewards.append(episode_reward)
 
+        # Progress logging
         if (ep + 1) % 20 == 0:
-            avg_reward = np.mean(reward_history[-20:])
-            print(f"  Q-Learning Episode {ep+1}/{n_episodes}, Avg Reward: {avg_reward:.2f}")
+            avg_reward = np.mean(episode_rewards[-20:])
+            print(f"  Episode {ep+1}/{n_episodes}, Avg Reward (last 20): {avg_reward:.2f}")
 
-    return agent, reward_history
+    print(f"✓ Q-Learning training complete!")
+    return agent, episode_rewards
 
 
 def train_qrdqn(
@@ -817,21 +836,23 @@ def train_qrdqn(
         n_episodes: Number of training episodes
         
     Returns:
-        Tuple of (trained_agent, reward_history)
+        Tuple of (trained_agent, episode_rewards)
     """
+    print(f"\n🎓 Training QR-DQN agent for {n_episodes} episodes...")
+    
     agent = QRDQNAgent(
         state_dim=6,
         lr=1e-3,
         gamma=0.95,
         epsilon=0.2,
         n_quantiles=51,
-        buffer_size=50_000,
+        buffer_size=50000,
         batch_size=64,
         tau_target=0.005,
         device=device
     )
 
-    reward_history = []
+    episode_rewards = []
 
     for ep in range(n_episodes):
         # Initialize episode
@@ -841,23 +862,16 @@ def train_qrdqn(
         episode_reward = 0.0
 
         while t < cfg.T_SIM:
-            # Extract context
+            # Create efficiency dictionary
             eff = {
                 'CS_base': 0.1,
                 'IF_ON': np.random.rand() < scn.if_prob,
                 'PER_jam': 0.0
             }
+            
+            # Extract context and convert to state vector
             ctx = extract_context(pos, scn.N, scn, eff)
-
-            # State vector (continuous)
-            state_vec = np.array([
-                ctx['dCenters'],
-                ctx['meanD'],
-                ctx['estPER'],
-                ctx['N'],
-                ctx['if_prob'],
-                ctx['bgLoad']
-            ], dtype=np.float32)
+            state_vec = context_to_state_vector(ctx)
 
             # Select action via QR-DQN
             action = agent.get_action(state_vec, explore=True)
@@ -867,47 +881,40 @@ def train_qrdqn(
             primary = np.random.randint(scn.N)
             result = pbft_round(mac_type, primary, pos, scn.N, t, eff, scn, cs, tdma, cfg)
 
-            # Calculate reward with physical units
+            # Calculate reward with jamming bonus
             reward = calculate_reward(result, cfg, 'QR-DQN', eff)
             episode_reward += reward
 
-            # Time step for mobility update
+            # Update position and time
             dt = result.latency if np.isfinite(result.latency) else cfg.DT
-            dt = max(dt, cfg.DT)  # Avoid zero
+            dt = max(dt, cfg.DT)  # Ensure minimum time step
             next_t = t + dt
             done = next_t >= cfg.T_SIM
 
-            # Update positions
             pos = update_positions(pos, vel, dt, scn.area)
             t = next_t
 
-            # Next state
-            eff_next = eff  # Same interference parameters within this small step
-            ctx_next = extract_context(pos, scn.N, scn, eff_next)
-            next_state_vec = np.array([
-                ctx_next['dCenters'],
-                ctx_next['meanD'],
-                ctx_next['estPER'],
-                ctx_next['N'],
-                ctx_next['if_prob'],
-                ctx_next['bgLoad']
-            ], dtype=np.float32)
+            # Get next state
+            ctx_next = extract_context(pos, scn.N, scn, eff)
+            next_state_vec = context_to_state_vector(ctx_next)
 
-            # QR-DQN update with replay
+            # QR-DQN update with replay buffer
             agent.update(state_vec, action, reward, next_state_vec, done=done)
 
-        reward_history.append(episode_reward)
+        episode_rewards.append(episode_reward)
 
+        # Progress logging
         if (ep + 1) % 20 == 0:
-            avg_reward = np.mean(reward_history[-20:])
-            print(f"  QR-DQN Episode {ep+1}/{n_episodes}, Avg Reward (last 20): {avg_reward:.2f}")
+            avg_reward = np.mean(episode_rewards[-20:])
+            print(f"  Episode {ep+1}/{n_episodes}, Avg Reward (last 20): {avg_reward:.2f}")
 
-    return agent, reward_history
+    print(f"✓ QR-DQN training complete!")
+    return agent, episode_rewards
 
 
-# ============================================================================#
-# POLICY EVALUATION (Evaluation after Training)
-# ============================================================================#
+# ============================================================================
+# POLICY EVALUATION
+# ============================================================================
 
 def evaluate_policy(
     policy_name: str,
@@ -922,7 +929,7 @@ def evaluate_policy(
     Evaluate a policy and collect all metrics.
     
     Args:
-        policy_name: Name of policy ('CSMA-only', 'TDMA-only', 'Q-Learning', 'QR-DQN')
+        policy_name: Name of policy ('CSMA-only', 'TDMA-only', 'Q-learning', 'QR-DQN')
         agent: Trained agent (None for baseline policies)
         scn: Scenario parameters
         cs: CSMA parameters
@@ -933,19 +940,24 @@ def evaluate_policy(
     Returns:
         ResultsAccumulator with latency, energy, throughput, etc.
     """
+    print(f"  Evaluating {policy_name}...")
     results = ResultsAccumulator()
 
     for run in range(n_runs):
+        # Initialize run
         pos = init_positions(scn.N, scn.area)
         vel = init_velocities(scn.N, scn.v_mean, scn.v_std)
         t = 0.0
 
         while t < cfg.T_SIM:
+            # Create efficiency dictionary
             eff = {
                 'CS_base': 0.1,
                 'IF_ON': np.random.rand() < scn.if_prob,
                 'PER_jam': 0.0
             }
+            
+            # Extract context
             ctx = extract_context(pos, scn.N, scn, eff)
 
             # Policy selection
@@ -953,22 +965,16 @@ def evaluate_policy(
                 action = 0
             elif policy_name == 'TDMA-only':
                 action = 1
-            elif policy_name == 'Q-Learning':
+            elif policy_name == 'Q-learning':
                 state = discretize_context(ctx)
                 action = agent.get_action(state, explore=False)
             elif policy_name == 'QR-DQN':
-                state_vec = np.array([
-                    ctx['dCenters'],
-                    ctx['meanD'],
-                    ctx['estPER'],
-                    ctx['N'],
-                    ctx['if_prob'],
-                    ctx['bgLoad']
-                ], dtype=np.float32)
+                state_vec = context_to_state_vector(ctx)
                 action = agent.get_action(state_vec, explore=False)
             else:
-                action = 0  # Default to CSMA
+                raise ValueError(f"Unknown policy name: {policy_name}")
 
+            # Execute PBFT round
             mac_type = 'CSMA' if action == 0 else 'TDMA'
             primary = np.random.randint(scn.N)
             result = pbft_round(mac_type, primary, pos, scn.N, t, eff, scn, cs, tdma, cfg)
@@ -984,8 +990,9 @@ def evaluate_policy(
             results.views.append(result.views)
             results.mac_choices.append(action)
 
-            # Update
+            # Update position and time
             dt = result.latency if np.isfinite(result.latency) else cfg.DT
+            dt = max(dt, cfg.DT)  # Ensure minimum time step
             pos = update_positions(pos, vel, dt, scn.area)
             t += dt
 
@@ -1001,7 +1008,7 @@ def evaluate_all_policies(
     qrdqn_agent: QRDQNAgent
 ) -> Dict[str, ResultsAccumulator]:
     """
-    Evaluate all policies: CSMA-only, TDMA-only, Q-Learning, QR-DQN.
+    Evaluate all policies: CSMA-only, TDMA-only, Q-learning, QR-DQN.
     
     Args:
         scn: Scenario parameters
@@ -1021,15 +1028,15 @@ def evaluate_all_policies(
     policies = [
         ('CSMA-only', None),
         ('TDMA-only', None),
-        ('Q-Learning', ql_agent),
+        ('Q-learning', ql_agent),
         ('QR-DQN', qrdqn_agent)
     ]
 
     for policy_name, agent in policies:
-        print(f"  Evaluating {policy_name}...")
         results = evaluate_policy(policy_name, agent, scn, cs, tdma, cfg, n_runs=50)
         all_results[policy_name] = results
 
+    print(f"✓ All policies evaluated!")
     return all_results
-
-
+        
+        self.Q[state][action] += self.alpha * td_error
