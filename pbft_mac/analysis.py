@@ -668,10 +668,10 @@ def run_full_pipeline(output_dir: str = "./results/"):
         
         # Train agents
         print("\n🎓 Training Q-Learning...")
-        ql_agent, ql_rewards = train_qlearning(SCN, CS, TDMA, cfg, n_episodes=100)
+        ql_agent, ql_rewards, env_state = train_qlearning(SCN, CS, TDMA, cfg, n_episodes=100)
         
         print("\n🎓 Training QR-DQN...")
-        qrdqn_agent, qrdqn_rewards = train_qrdqn(SCN, CS, TDMA, cfg, n_episodes=100)
+        qrdqn_agent, qrdqn_rewards, env_state = train_qrdqn(SCN, CS, TDMA, cfg, n_episodes=100)
         
         # Plot training curves
         plot_training_curves(ql_rewards, qrdqn_rewards, output_dir)
@@ -723,3 +723,4 @@ def run_full_pipeline(output_dir: str = "./results/"):
     print(f"{'='*80}")
     
     return all_results_by_scenario, df_summary
+
