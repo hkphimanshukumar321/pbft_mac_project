@@ -1,4 +1,5 @@
 # pbft_mac/core.py
+#updated conistency  
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict
@@ -377,4 +378,5 @@ def extract_context(pos: np.ndarray, N: int, SCN: ScenarioParams,
     }
     
     return ctx
+
 
