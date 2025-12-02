@@ -623,7 +623,6 @@ def export_latex_table(df_summary: pd.DataFrame, output_dir: str = "./"):
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
-
 def run_full_pipeline(output_dir: str = "./results/"):
     """
     Complete end-to-end pipeline:
@@ -666,18 +665,18 @@ def run_full_pipeline(output_dir: str = "./results/"):
         print(f"📡 SCENARIO: {SCN.name}")
         print(f"{'='*80}")
         
-        # Train agents
+        # Train agents and get their environment states
         print("\n🎓 Training Q-Learning...")
-        ql_agent, ql_rewards, env_state = train_qlearning(SCN, CS, TDMA, cfg, n_episodes=100)
+        ql_agent, ql_rewards, ql_env_state = train_qlearning(SCN, CS, TDMA, cfg, n_episodes=100)
         
         print("\n🎓 Training QR-DQN...")
-        qrdqn_agent, qrdqn_rewards, env_state = train_qrdqn(SCN, CS, TDMA, cfg, n_episodes=100)
+        qrdqn_agent, qrdqn_rewards, qrdqn_env_state = train_qrdqn(SCN, CS, TDMA, cfg, n_episodes=100)
         
         # Plot training curves
         plot_training_curves(ql_rewards, qrdqn_rewards, output_dir)
         
-        # Evaluate all policies
-        all_results = evaluate_all_policies(SCN, CS, TDMA, cfg, ql_agent, qrdqn_agent)
+        # Evaluate all policies, passing the environment states
+        all_results = evaluate_all_policies(SCN, CS, TDMA, cfg, ql_agent, qrdqn_agent, ql_env_state, qrdqn_env_state)
         all_results_by_scenario[SCN.name] = all_results
         
         # Print statistics
@@ -723,4 +722,5 @@ def run_full_pipeline(output_dir: str = "./results/"):
     print(f"{'='*80}")
     
     return all_results_by_scenario, df_summary
+
 
