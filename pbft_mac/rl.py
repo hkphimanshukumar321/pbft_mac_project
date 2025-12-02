@@ -8,6 +8,8 @@ from typing import Dict, Tuple, List, Optional
 from collections import defaultdict, deque
 import random
 
+
+from dataclasses import dataclass
 from .core import (
     Config,
     ScenarioParams,
@@ -1185,3 +1187,4 @@ def evaluate_all_policies(
 
     print(f"✓ All policies evaluated!")
     return all_results
+
