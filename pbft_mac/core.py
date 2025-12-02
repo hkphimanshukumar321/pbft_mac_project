@@ -170,16 +170,10 @@ def init_velocities(N: int, v_mean: float, v_std: float) -> np.ndarray:
     return np.column_stack([speeds * np.cos(angles), speeds * np.sin(angles)])
 
 def update_positions(pos: np.ndarray, vel: np.ndarray, dt: float, area: float) -> np.ndarray:
-    """
-    Update positions with boundary reflection (vectorized).
-
-    pos: (N, 2)
-    vel: (N, 2)
-    """
     pos_new = pos + vel * dt
 
     # Reflect on lower boundary (0)
-    lower_mask = pos_new < 0.0           # shape (N, 2), bool
+    lower_mask = pos_new < 0.0
     pos_new[lower_mask] = -pos_new[lower_mask]
     vel[lower_mask] = -vel[lower_mask]
 
@@ -383,3 +377,4 @@ def extract_context(pos: np.ndarray, N: int, SCN: ScenarioParams,
     }
     
     return ctx
+
