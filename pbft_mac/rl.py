@@ -1039,4 +1039,5 @@ def evaluate_all_policies(
     print(f"✓ All policies evaluated!")
     return all_results
         
-        self.Q[state][action] += self.alpha * td_error
+    self.Q[state][action] += self.alpha * td_error
+
