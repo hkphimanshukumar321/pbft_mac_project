@@ -1,5 +1,3 @@
-# pbft_mac/__init__.py
-
 from .core import (
     Config,
     ScenarioParams,
